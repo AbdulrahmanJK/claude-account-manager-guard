@@ -1,0 +1,26 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Runtime files & Logs
+*.log
+guard.log
+current_profile.txt
+
+# Binaries & compiled artifacts
+ClaudeVPNGuard
+Gatekeeper
+Claude-Engine.app
+*.o
+*.swiftdoc
+*.swiftmodule
+
+# Local user profiles & data
+profiles/
+.claude.json
+*.bak*
+*.backup*
+guard-settings.json
+.env
