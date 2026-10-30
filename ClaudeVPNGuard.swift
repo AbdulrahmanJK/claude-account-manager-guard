@@ -2,7 +2,7 @@ import Cocoa
 import NetworkExtension
 import Darwin
 
-final class ClaudeVPNGuard {
+final class ClaudeVPNGuard: NSObject {
     static let shared = ClaudeVPNGuard()
 
     private let claudeBundleId = "com.anthropic.claudefordesktop"
@@ -20,17 +20,80 @@ final class ClaudeVPNGuard {
     private var lastReconnectAttempt: Date = .distantPast
     private var checkTimer: Timer?
 
-    private init() {}
+    private let control = GuardControl()
+    private var controlState = GuardControl().load()
+    private var statusItem: NSStatusItem?
+    private var toggleItem: NSMenuItem?
+    private var guardIsActive: Bool { controlState.enabled && control.load().enabled }
+
+    private override init() { super.init() }
+
+    private func setupControlMenu() {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        let menu = NSMenu()
+        let toggle = NSMenuItem(title: "VPN Guard включён", action: #selector(toggleProtection), keyEquivalent: "")
+        toggle.target = self
+        menu.addItem(toggle)
+        let hint = NSMenuItem(title: "Автосмена VPN и защита Claude", action: nil, keyEquivalent: "")
+        hint.isEnabled = false
+        menu.addItem(hint)
+        item.menu = menu
+        statusItem = item
+        toggleItem = toggle
+        updateControlMenu()
+        DistributedNotificationCenter.default().addObserver(self, selector: #selector(controlChanged), name: GuardControl.notification, object: nil)
+    }
+
+    private func updateControlMenu() {
+        toggleItem?.state = controlState.enabled ? .on : .off
+        toggleItem?.title = controlState.enabled ? "VPN Guard включён" : "VPN Guard выключен"
+        statusItem?.button?.title = controlState.enabled ? "VPN Guard ✓" : "VPN Guard выкл."
+        statusItem?.button?.toolTip = "Включить или выключить защиту и автоматическое переключение VPN для Claude"
+    }
+
+    @objc private func toggleProtection() {
+        do {
+            try control.setEnabled(!control.load().enabled)
+            controlChanged()
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Не удалось сохранить состояние VPN Guard"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+        }
+    }
+
+    @objc private func controlChanged() {
+        refreshControlState()
+        periodicCheck()
+    }
+
+    private func refreshControlState() {
+        let next = control.load()
+        guard next != controlState else { return }
+        controlState = next
+        isScriptAction = false
+        isPromptActive = false
+        lastReconnectAttempt = .distantPast
+        if !next.enabled {
+            isKillSwitchEngaged = false
+            resumeClaude()
+            log("VPN Guard выключен: автосмена VPN и блокировка Claude отключены.")
+        } else {
+            log("VPN Guard включён.")
+        }
+        isClaudeRunning = isClaudeEngineRunning()
+        updateControlMenu()
+    }
+
+    private func operationIsCurrent(_ revision: String) -> Bool {
+        let state = control.load()
+        return state.enabled && state.revision == revision
+    }
 
     func start() {
-        log("Claude VPN Guard v4.1 (Gatekeeper + процессная защита) запущен.")
-        guard settings != nil else {
-            isClaudeRunning = isClaudeEngineRunning()
-            if isClaudeRunning { engageKillSwitch(reason: "Отсутствуют настройки VPN") }
-            log("Ошибка: отсутствуют или повреждены настройки VPN в guard-settings.json")
-            return
-        }
-
+        log("Claude VPN Guard v4.2 (переключаемая защита) запущен.")
+        setupControlMenu()
         // 1. Загружаем настройки защищенного VPN
         loadSecureVpnPreferences()
 
@@ -129,7 +192,7 @@ final class ClaudeVPNGuard {
         guard let app = notif.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
               app.bundleIdentifier == defaultVpnBundleId else { return }
 
-        if isClaudeRunning && !isScriptAction && !isPromptActive && !isSystemSleeping {
+        if guardIsActive && isClaudeRunning && !isScriptAction && !isPromptActive && !isSystemSleeping {
             log("Пользователь открыл стороннее приложение VPN при работающем Claude!")
             handleUnauthorizedSwitch()
         }
@@ -139,7 +202,7 @@ final class ClaudeVPNGuard {
         let status = NEVPNManager.shared().connection.status
         log("Статус защищенного VPN: \(statusDescription(status))")
 
-        guard isClaudeRunning, !isSystemSleeping else { return }
+        guard guardIsActive, isClaudeRunning, !isSystemSleeping else { return }
 
         if status == .connected {
             if isKillSwitchEngaged && VpnSafety.mayResume(status, defaultStatus: getDefaultVpnStatus()) {
@@ -157,14 +220,14 @@ final class ClaudeVPNGuard {
     // MARK: - Kill Switch Engine
 
     private func engageKillSwitch(reason: String) {
-        guard !isKillSwitchEngaged else { return }
+        guard guardIsActive, !isKillSwitchEngaged else { return }
         isKillSwitchEngaged = true
         log("⚠️ СРАБОТАЛ KILL SWITCH: \(reason). Заморозка процесса Claude на уровне ядра...")
         suspendClaude()
     }
 
     private func disengageKillSwitch() {
-        guard isKillSwitchEngaged else { return }
+        guard guardIsActive, isKillSwitchEngaged else { return }
         guard VpnSafety.mayResume(NEVPNManager.shared().connection.status, defaultStatus: getDefaultVpnStatus()) else {
             log("Claude остаётся замороженным: защищённый VPN не подтверждён или включён второй VPN.")
             return
@@ -177,13 +240,17 @@ final class ClaudeVPNGuard {
     // MARK: - Sleep & Wake Handlers
 
     private func handleSystemWillSleep() {
-        guard isClaudeEngineRunning() else { return }
+        isSystemSleeping = true
+        guard guardIsActive, isClaudeEngineRunning() else { return }
         log("Mac уходит в сон. Включение Kill Switch для Claude...")
         isSystemSleeping = true
         engageKillSwitch(reason: "Переход в режим сна")
     }
 
     private func handleSystemDidWake() {
+        isSystemSleeping = false
+        guard guardIsActive else { return }
+        let revision = controlState.revision
         guard isClaudeEngineRunning() else {
             isSystemSleeping = false
             return
@@ -196,7 +263,10 @@ final class ClaudeVPNGuard {
             guard let self = self else { return }
 
             Thread.sleep(forTimeInterval: 3.5)
-            self.connectSecureVpn()
+            DispatchQueue.main.async {
+                guard self.operationIsCurrent(revision) else { return }
+                self.connectSecureVpn()
+            }
 
             let start = Date()
             var connected = false
@@ -210,6 +280,7 @@ final class ClaudeVPNGuard {
 
             DispatchQueue.main.async {
                 self.isSystemSleeping = false
+                guard self.operationIsCurrent(revision) else { return }
                 if connected {
                     self.log("Защищенный VPN восстановлен после сна! Снятие Kill Switch.")
                     self.disengageKillSwitch()
@@ -223,6 +294,11 @@ final class ClaudeVPNGuard {
     // MARK: - Periodic Safety Check
 
     private func periodicCheck() {
+        refreshControlState()
+        guard guardIsActive else {
+            isClaudeRunning = isClaudeEngineRunning()
+            return
+        }
         guard !isSystemSleeping else { return }
 
         let currentlyRunning = isClaudeEngineRunning()
@@ -234,6 +310,10 @@ final class ClaudeVPNGuard {
         if currentlyRunning && !isClaudeRunning { isClaudeRunning = true }
 
         guard isClaudeRunning else { return }
+        guard settings != nil else {
+            engageKillSwitch(reason: "Отсутствуют настройки VPN")
+            return
+        }
 
         // Check the protected tunnel before calling the slower scutil process.
         let vpnStatus = NEVPNManager.shared().connection.status
@@ -258,6 +338,7 @@ final class ClaudeVPNGuard {
     // MARK: - Termination & Switch Handlers
 
     private func handleClaudeTerminated() {
+        guard guardIsActive else { isClaudeRunning = false; return }
         guard isClaudeRunning else { return }
         guard !isClaudeEngineRunning() else {
             log("Ожидаем завершения всех процессов Claude до смены VPN.")
@@ -283,6 +364,7 @@ final class ClaudeVPNGuard {
     }
 
     private func handleBackgroundReconnect() {
+        guard guardIsActive, settings != nil else { return }
         let now = Date()
         guard now.timeIntervalSince(lastReconnectAttempt) > 4.0 else { return }
         lastReconnectAttempt = now
@@ -292,8 +374,9 @@ final class ClaudeVPNGuard {
     }
 
     private func handleUnauthorizedSwitch() {
-        guard !isPromptActive, !isScriptAction, !isSystemSleeping else { return }
+        guard guardIsActive, !isPromptActive, !isScriptAction, !isSystemSleeping else { return }
         isPromptActive = true
+        let revision = controlState.revision
 
         engageKillSwitch(reason: "Попытка переключения на сторонний VPN")
 
@@ -303,6 +386,7 @@ final class ClaudeVPNGuard {
             let quitConfirmed = self.askUserToQuitClaude()
 
             DispatchQueue.main.async {
+                guard self.operationIsCurrent(revision) else { return }
                 self.isPromptActive = false
 
                 if quitConfirmed {
@@ -331,6 +415,7 @@ final class ClaudeVPNGuard {
                         }
 
                         DispatchQueue.main.async {
+                            guard self.operationIsCurrent(revision) else { return }
                             if NEVPNManager.shared().connection.status == .connected {
                                 self.disengageKillSwitch()
                                 self.focusClaude()
@@ -417,9 +502,11 @@ final class ClaudeVPNGuard {
     }
 
     private func connectSecureVpn() {
+        guard guardIsActive, settings != nil else { return }
+        let revision = controlState.revision
         NEVPNManager.shared().loadFromPreferences { [weak self] error in
             DispatchQueue.main.async {
-                guard let self else { return }
+                guard let self, self.operationIsCurrent(revision) else { return }
                 if let error { self.log("Ошибка загрузки защищённого VPN: \(error.localizedDescription)"); return }
                 do {
                     try NEVPNManager.shared().connection.startVPNTunnel()
@@ -432,6 +519,7 @@ final class ClaudeVPNGuard {
     }
 
     private func disconnectSecureVpn() {
+        guard guardIsActive, settings != nil else { return }
         NEVPNManager.shared().connection.stopVPNTunnel()
         log("Команда отключения защищенного VPN отправлена.")
     }
@@ -450,6 +538,7 @@ final class ClaudeVPNGuard {
     }
 
     private func connectDefaultVpn() {
+        guard guardIsActive, settings != nil else { return }
         log("Подключение \(defaultVpnServiceName)...")
         let task = Process()
         task.launchPath = "/usr/sbin/scutil"
@@ -459,6 +548,7 @@ final class ClaudeVPNGuard {
     }
 
     private func disconnectDefaultVpn() {
+        guard guardIsActive, settings != nil else { return }
         log("Отключение \(defaultVpnServiceName)...")
         let task = Process()
         task.launchPath = "/usr/sbin/scutil"

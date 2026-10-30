@@ -134,8 +134,26 @@ final class GatekeeperApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let enginePath: String = NSString(string: "~/.claude-vpn-guard/Claude-Engine.app").expandingTildeInPath
     private let claudeBundleId = "com.anthropic.claudefordesktop"
     private let guardSettings = GuardSettings.load()
+    private let control = GuardControl()
+    private var guardSwitch: NSSwitch?
+    private var isLaunchPending = false
+    private var isLaunchingEngine = false
+
+    @objc private func toggleGuard(_ sender: NSSwitch) {
+        do { try control.setEnabled(sender.state == .on) }
+        catch {
+            sender.state = control.load().enabled ? .on : .off
+            showErrorAlert(title: "Не удалось сохранить состояние VPN Guard", message: error.localizedDescription)
+        }
+    }
+
+    @objc private func guardControlChanged() {
+        guardSwitch?.state = control.load().enabled ? .on : .off
+        if isLaunchPending && !control.load().enabled { connectionSucceeded() }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        DistributedNotificationCenter.default().addObserver(self, selector: #selector(guardControlChanged), name: GuardControl.notification, object: nil)
         if let icon = Bundle.main.image(forResource: "electron.icns") ?? (NSWorkspace.shared.icon(forFile: enginePath) as NSImage?) {
             NSApp.applicationIconImage = icon
         }
@@ -145,12 +163,6 @@ final class GatekeeperApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 title: "Ошибка запуска Claude",
                 message: "Движок Claude не найден по пути:\n\(enginePath)\n\nЗапустите ~/.claude-vpn-guard/install.sh"
             )
-            NSApp.terminate(nil)
-            return
-        }
-
-        guard guardSettings != nil else {
-            showErrorAlert(title: "Настройки VPN не найдены", message: "Проверьте ~/.claude-vpn-guard/guard-settings.json и повторите установку.")
             NSApp.terminate(nil)
             return
         }
@@ -237,7 +249,7 @@ final class GatekeeperApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let rowSpacing: CGFloat = 8
         let contentHeight = CGFloat(slotCount) * rowHeight + CGFloat(max(0, slotCount - 1)) * rowSpacing
         let listHeight = min(contentHeight, 240)
-        return 114 + 12 + listHeight + 10 + 36 + 8 + 18 + 14
+        return 114 + 12 + listHeight + 10 + 36 + 8 + 18 + 14 + 62
     }
 
     private func buildPickerContent() {
@@ -376,6 +388,23 @@ final class GatekeeperApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         spinner.controlSize = .small
         spinner.isHidden = true
         addBtn.addSubview(spinner)
+
+        let label = NSTextField(labelWithString: "VPN Guard")
+        label.frame = NSRect(x: 24, y: 64, width: 240, height: 20)
+        label.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        visualEffect.addSubview(label)
+        let toggle = NSSwitch(frame: NSRect(x: width - 66, y: 60, width: 42, height: 26))
+        toggle.state = control.load().enabled ? .on : .off
+        toggle.target = self
+        toggle.action = #selector(toggleGuard(_:))
+        toggle.setAccessibilityLabel("VPN Guard: автосмена VPN и защита Claude")
+        visualEffect.addSubview(toggle)
+        guardSwitch = toggle
+        let detail = NSTextField(labelWithString: "Автосмена VPN и блокировка при обрыве")
+        detail.frame = NSRect(x: 24, y: 42, width: width - 48, height: 16)
+        detail.font = NSFont.systemFont(ofSize: 11)
+        detail.textColor = .secondaryLabelColor
+        visualEffect.addSubview(detail)
 
         // 7. Подсказка горячих клавиш внизу
         let hintLabel = NSTextField(frame: NSRect(x: 16, y: 12, width: width - 32, height: 16))
@@ -596,11 +625,22 @@ final class GatekeeperApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
 
+        isLaunchPending = true
         connectionFinished = false
+        if !control.load().enabled {
+            launchClaudeEngine()
+            return
+        }
+        guard guardSettings != nil else {
+            connectionFailed(reason: "Настройки VPN не найдены")
+            return
+        }
         launchDeadline = Date().addingTimeInterval(10)
         disconnectDefaultVpn()
         loadSecureVpnManager { [weak self] manager in
             guard let self = self else { return }
+            guard !self.isLaunchingEngine, !self.connectionFinished else { return }
+            guard self.control.load().enabled else { self.connectionSucceeded(); return }
             guard let manager else {
                 self.connectionFailed(reason: "Не удалось загрузить настройки защищённого VPN")
                 return
@@ -795,6 +835,8 @@ final class GatekeeperApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // MARK: - Secure Connection Flow
 
     private func beginSecureConnection(manager: NEVPNManager) {
+        guard !isLaunchingEngine, !connectionFinished else { return }
+        guard control.load().enabled else { connectionSucceeded(); return }
         disconnectDefaultVpn()
 
         NotificationCenter.default.addObserver(
@@ -834,6 +876,7 @@ final class GatekeeperApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func connectionFailed(reason: String) {
+        if !control.load().enabled { connectionSucceeded(); return }
         guard !connectionFinished else { return }
         connectionFinished = true
         connectionTimer?.invalidate()
@@ -842,6 +885,7 @@ final class GatekeeperApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             self.hudWindow?.orderOut(nil)
+            if !self.control.load().enabled { self.launchClaudeEngine(); return }
 
             self.connectDefaultVpn()
 
@@ -855,22 +899,31 @@ final class GatekeeperApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func launchClaudeEngine() {
-        guard NEVPNManager.shared().connection.status == .connected else {
-            connectionFinished = false
-            connectionFailed(reason: "VPN отключился до запуска Claude")
-            return
-        }
-        guard getDefaultVpnStatus() == "Disconnected" else {
-            if Date() < launchDeadline {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                    self?.launchClaudeEngine()
-                }
-            } else {
+        guard !isLaunchingEngine else { return }
+        if control.load().enabled {
+            guard NEVPNManager.shared().connection.status == .connected else {
                 connectionFinished = false
-                connectionFailed(reason: "Повседневный VPN не отключился перед запуском Claude")
+                connectionFailed(reason: "VPN отключился до запуска Claude")
+                return
             }
-            return
+            guard getDefaultVpnStatus() == "Disconnected" else {
+                if Date() < launchDeadline {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                        self?.launchClaudeEngine()
+                    }
+                } else {
+                    connectionFinished = false
+                    connectionFailed(reason: "Повседневный VPN не отключился перед запуском Claude")
+                }
+                return
+            }
         }
+        isLaunchingEngine = true
+        isLaunchPending = false
+        connectionFinished = true
+        connectionTimer?.invalidate()
+        connectionTimer = nil
+        hudWindow?.orderOut(nil)
         let engineUrl = URL(fileURLWithPath: enginePath)
         let config = NSWorkspace.OpenConfiguration()
         config.activates = true
@@ -987,6 +1040,7 @@ final class GatekeeperApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func disconnectDefaultVpn() {
+        guard control.load().enabled else { return }
         guard let serviceName = guardSettings?.defaultVpnServiceName else { return }
         let task = Process()
         task.launchPath = "/usr/sbin/scutil"
@@ -996,6 +1050,7 @@ final class GatekeeperApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func connectDefaultVpn() {
+        guard control.load().enabled else { return }
         guard let serviceName = guardSettings?.defaultVpnServiceName else { return }
         let task = Process()
         task.launchPath = "/usr/sbin/scutil"

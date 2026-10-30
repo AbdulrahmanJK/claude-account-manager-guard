@@ -24,3 +24,4 @@ profiles/
 *.backup*
 guard-settings.json
 .env
+guard-control.json

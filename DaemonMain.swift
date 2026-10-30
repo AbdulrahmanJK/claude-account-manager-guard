@@ -6,6 +6,6 @@ struct DaemonMain {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
         ClaudeVPNGuard.shared.start()
-        RunLoop.main.run()
+        app.run()
     }
 }
