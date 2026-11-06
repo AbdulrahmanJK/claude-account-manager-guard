@@ -203,11 +203,28 @@ enum SystemVpnServices {
         let pipe = Pipe()
         task.standardOutput = pipe
         task.standardError = FileHandle.nullDevice
+        // Не waitUntilExit: он крутит run loop текущего потока, и таймер агента успевал бы зайти
+        // в проверку посреди переключения VPN. Семафор просто ждёт, ничего не исполняя.
+        let exited = DispatchSemaphore(value: 0)
+        task.terminationHandler = { _ in exited.signal() }
         do { try task.run() } catch { return "" }
-        // Читаем до waitUntilExit: при большом выводе процесс иначе заблокируется на заполненном пайпе.
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-        return String(data: data, encoding: .utf8) ?? ""
+
+        // Вывод читаем в фоне: при заполненном пайпе scutil иначе не завершится.
+        final class Box { var data = Data() }
+        let box = Box()
+        let readDone = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            box.data = pipe.fileHandleForReading.readDataToEndOfFile()
+            readDone.signal()
+        }
+        // После пробуждения configd бывает подвисает. Без таймаута вместе со scutil
+        // вставал бы весь агент — и kill switch тоже.
+        if exited.wait(timeout: .now() + 5) == .timedOut {
+            task.terminate()
+            _ = exited.wait(timeout: .now() + 1)
+        }
+        _ = readDone.wait(timeout: .now() + 1)
+        return String(data: box.data, encoding: .utf8) ?? ""
     }
 }
 
@@ -254,42 +271,94 @@ enum VpnSwitcher {
 
     /// Режим «работает Claude»: гасим всё, кроме рабочего VPN, и поднимаем рабочий.
     static func enterClaudeMode(_ config: VpnConfig, log: (String) -> Void) {
-        stopAllExceptWork(config, log: log)
-        guard let work = config.work else { return }
+        enforceClaudeMode(config, force: true, log: log)
+    }
+
+    /// Доводит систему до режима «работает Claude» и возвращает снимок до команд.
+    /// Вызывается на каждом шаге ожидания, а не один раз: туннель в состоянии «disconnecting»
+    /// (Claude только что закрыли и сразу открыли) команду start игнорирует, а VPN с автоподключением
+    /// поднимается снова после stop. Повторы ограничены одной командой в 4 секунды на VPN,
+    /// иначе ожидание с шагом 0,5 с засыпало бы клиент VPN командами.
+    @discardableResult
+    static func enforceClaudeMode(_ config: VpnConfig, force: Bool = false, log: (String) -> Void) -> VpnSnapshot {
+        let services = SystemVpnServices.all()
+        let work = config.work
+        let workServiceName = work?.kind == .service ? work?.serviceName : nil
+        // «disconnecting» не трогаем: туннель и так выключается, повторный stop ничего не даст.
+        for service in services where service.name != workServiceName && (service.state == .connected || service.state == .connecting) {
+            if allowCommand("stop:" + service.name, force: force) {
+                log("Выключаем \(service.name)…")
+                SystemVpnServices.runScutil(["--nc", "stop", service.name])
+                noteStopped(service.name)
+            }
+        }
+        for entry in config.entries where entry.kind == .app && entry.id != work?.id && !appState(entry).isOff {
+            if allowCommand("stop:" + entry.id, force: force) {
+                log("Закрываем \(entry.name)…")
+                stop(entry)
+                noteStopped(entry.name)
+            }
+        }
         // Уже подключённый или подключающийся туннель не трогаем: повторный start
         // у некоторых клиентов рвёт текущее соединение.
-        if state(of: work).isOff {
+        if let work, state(of: work, services: services).isOff, allowCommand("start:" + work.id, force: force) {
             log("Включаем \(work.name)…")
             start(work)
         }
+        return snapshot(config)
     }
 
     /// Режим «Claude закрыт»: выключаем рабочий VPN и включаем второй.
     /// Без второго VPN ничего не меняем — пользователь сам решает, что включено вне Claude.
     static func leaveClaudeMode(_ config: VpnConfig, log: (String) -> Void) {
-        guard let other = config.other else {
+        guard config.other != nil else {
             log("VPN без Claude не выбран — подключения не меняем.")
             return
         }
-        if let work = config.work, !state(of: work).isOff {
-            log("Выключаем \(work.name)…")
-            stop(work)
-        }
-        log("Включаем \(other.name)…")
-        start(other)
+        enforceClosedMode(config, force: true, log: log)
     }
 
-    static func stopAllExceptWork(_ config: VpnConfig, log: (String) -> Void) {
-        let work = config.work
-        let workServiceName = work?.kind == .service ? work?.serviceName : nil
-        for service in SystemVpnServices.all() where service.name != workServiceName && !service.state.isOff {
-            log("Выключаем \(service.name)…")
-            SystemVpnServices.runScutil(["--nc", "stop", service.name])
+    /// Доводит систему до режима «Claude закрыт». Возвращает true, когда второй VPN подключён
+    /// (или его нет и доводить нечего).
+    @discardableResult
+    static func enforceClosedMode(_ config: VpnConfig, force: Bool = false, log: (String) -> Void) -> Bool {
+        guard let other = config.other else { return true }
+        let services = SystemVpnServices.all()
+        if let work = config.work {
+            let workState = state(of: work, services: services)
+            if (workState == .connected || workState == .connecting) && allowCommand("stop:" + work.id, force: force) {
+                log("Выключаем \(work.name)…")
+                stop(work)
+            }
         }
-        for entry in config.entries where entry.kind == .app && entry.id != work?.id && !appState(entry).isOff {
-            log("Закрываем \(entry.name)…")
-            stop(entry)
+        let otherState = state(of: other, services: services)
+        if otherState.isOff && allowCommand("start:" + other.id, force: force) {
+            log("Включаем \(other.name)…")
+            start(other)
         }
+        return otherState == .connected
+    }
+
+    /// true, если guard сам выключил этот VPN меньше `seconds` назад. Повторное появление такого VPN
+    /// почти всегда означает автоподключение (On Demand) в его приложении — об этом стоит сказать.
+    static func wasRecentlyStopped(_ name: String, within seconds: TimeInterval = 60) -> Bool {
+        guard let at = lastStopped[name] else { return false }
+        return ProcessInfo.processInfo.systemUptime - at < seconds
+    }
+
+    // Время по systemUptime, а не Date: не скачет при переводе часов и стоит на месте во время сна.
+    private static var lastCommand: [String: TimeInterval] = [:]
+    private static var lastStopped: [String: TimeInterval] = [:]
+
+    private static func allowCommand(_ key: String, force: Bool) -> Bool {
+        let now = ProcessInfo.processInfo.systemUptime
+        if !force, let last = lastCommand[key], now - last < 4 { return false }
+        lastCommand[key] = now
+        return true
+    }
+
+    private static func noteStopped(_ name: String) {
+        lastStopped[name] = ProcessInfo.processInfo.systemUptime
     }
 
     static func start(_ entry: VpnEntry) {

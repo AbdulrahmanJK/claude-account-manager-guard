@@ -695,7 +695,10 @@ final class GatekeeperApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         launchPoller.start(timeout: 15, until: { [weak self] in
             guard let self else { return true }
             // Выключение guard во время ожидания отпускает запуск без VPN — так же, как в прежней версии.
-            return !self.control.load().enabled || VpnSafety.mayResume(VpnSwitcher.snapshot(config))
+            if !self.control.load().enabled { return true }
+            // Не просто ждём, а доводим: рабочий VPN мог быть в «disconnecting» после недавнего
+            // закрытия Claude и пропустить первую команду, а VPN с автоподключением — подняться снова.
+            return VpnSafety.mayResume(VpnSwitcher.enforceClaudeMode(config) { print($0) })
         }) { [weak self] ok in
             guard let self else { return }
             if ok {
