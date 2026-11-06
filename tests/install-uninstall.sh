@@ -9,8 +9,8 @@ export CLAUDE_APP_PATH="$FIXTURE/Applications/Claude.app"
 export CLAUDE_GUARD_SKIP_LAUNCH_AGENT=1
 export CLANG_MODULE_CACHE_PATH=/private/tmp/claude-guard-swift-cache
 export SWIFT_MODULECACHE_PATH=/private/tmp/claude-guard-swift-cache
-export DEFAULT_VPN_SERVICE_NAME="Example VPN"
-export DEFAULT_VPN_BUNDLE_ID="com.example.vpn"
+export WORK_VPN_SERVICE_NAME="Example Work VPN"
+export OTHER_VPN_SERVICE_NAME="Example VPN"
 mkdir -p "$CLAUDE_APP_PATH/Contents/MacOS" "$HOME/Library/Application Support/Claude"
 cat > "$CLAUDE_APP_PATH/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -27,6 +27,13 @@ printf '{"fixture":true}\n' > "$HOME/.claude.json"
 
 "$ROOT/install.sh" >/dev/null
 test -f "$CLAUDE_GUARD_HOME/profiles/work/session.fixture"
+python3 - "$CLAUDE_GUARD_HOME/vpn-config.json" <<'PY'
+import json, sys
+config = json.load(open(sys.argv[1]))
+names = {e["id"]: e["serviceName"] for e in config["entries"]}
+assert names[config["workVpnId"]] == "Example Work VPN"
+assert names[config["otherVpnId"]] == "Example VPN"
+PY
 test "$(readlink "$HOME/Library/Application Support/Claude")" = "$CLAUDE_GUARD_HOME/active"
 test "$(readlink "$HOME/.claude.json")" = "$CLAUDE_GUARD_HOME/active/.claude.json"
 "$CLAUDE_GUARD_HOME/ProfileCtl" switch personal >/dev/null

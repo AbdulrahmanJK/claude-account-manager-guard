@@ -92,32 +92,39 @@ if pgrep -f "$ENGINE_PATH/Contents/MacOS/Claude" >/dev/null 2>&1; then
     fail "Полностью закройте Claude (Cmd+Q) перед установкой"
 fi
 
-# Preserve an existing local configuration. New installations require explicit VPN settings.
-if [ ! -f "$DEST_DIR/guard-settings.json" ]; then
-    [ -n "${DEFAULT_VPN_SERVICE_NAME:-}" ] || fail "Задайте DEFAULT_VPN_SERVICE_NAME для первой установки"
-    [ -n "${DEFAULT_VPN_BUNDLE_ID:-}" ] || fail "Задайте DEFAULT_VPN_BUNDLE_ID для первой установки"
-    python3 - "$DEST_DIR/guard-settings.json" <<'PY'
+# Существующие настройки VPN не трогаем. Для новой установки их можно задать переменными
+# WORK_VPN_SERVICE_NAME / OTHER_VPN_SERVICE_NAME (имена из `scutil --nc list`), а можно выбрать
+# потом в окне «Настройки VPN»: без рабочего VPN guard просто не пустит Claude в сеть.
+# Старый guard-settings.json остаётся — из него Swift-код сам переносит VPN «без Claude».
+if [ ! -f "$DEST_DIR/vpn-config.json" ] && [ -n "${WORK_VPN_SERVICE_NAME:-}" ]; then
+    python3 - "$DEST_DIR/vpn-config.json" <<'PY'
 import json, os, pathlib, sys
-settings = {
-    "defaultVpnServiceName": os.environ["DEFAULT_VPN_SERVICE_NAME"],
-    "defaultVpnBundleId": os.environ["DEFAULT_VPN_BUNDLE_ID"],
-}
-pathlib.Path(sys.argv[1]).write_text(json.dumps(settings, ensure_ascii=False, indent=2) + "\n")
+def entry(key, service):
+    return {"id": key, "name": service, "kind": "service", "serviceName": service}
+entries = [entry("work", os.environ["WORK_VPN_SERVICE_NAME"])]
+other = os.environ.get("OTHER_VPN_SERVICE_NAME", "")
+if other:
+    entries.append(entry("other", other))
+config = {"version": 2, "entries": entries, "workVpnId": "work", "otherVpnId": "other" if other else None}
+pathlib.Path(sys.argv[1]).write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n")
 PY
-    chmod 600 "$DEST_DIR/guard-settings.json"
+    chmod 600 "$DEST_DIR/vpn-config.json"
 fi
-python3 - "$DEST_DIR/guard-settings.json" <<'PY'
+if [ -f "$DEST_DIR/vpn-config.json" ]; then
+    python3 - "$DEST_DIR/vpn-config.json" <<'PY' || fail "vpn-config.json повреждён — исправьте или удалите его и выберите VPN в настройках"
 import json, sys
-data=json.load(open(sys.argv[1]))
-assert isinstance(data.get("defaultVpnServiceName"), str) and data["defaultVpnServiceName"]
-assert isinstance(data.get("defaultVpnBundleId"), str) and data["defaultVpnBundleId"]
+data = json.load(open(sys.argv[1]))
+assert isinstance(data.get("entries"), list)
 PY
+fi
 
 ARCH="$(uname -m)"
 case "$ARCH" in arm64|x86_64) ;; *) fail "Неподдерживаемая архитектура: $ARCH" ;; esac
 TARGET="$ARCH-apple-macos13.0"
-swiftc -O -parse-as-library -target "$TARGET" "$SOURCE_DIR/ClaudeVPNGuard.swift" "$SOURCE_DIR/DaemonMain.swift" "$SOURCE_DIR/GuardSettings.swift" "$SOURCE_DIR/VpnSafety.swift" -o "$STAGE/ClaudeVPNGuard"
-swiftc -O -parse-as-library -target "$TARGET" "$SOURCE_DIR/gatekeeper-src/Gatekeeper.swift" "$SOURCE_DIR/gatekeeper-src/ProfileStore.swift" "$SOURCE_DIR/GuardSettings.swift" -o "$STAGE/Gatekeeper"
+# Общий код VPN: окно запуска и агент в строке меню должны одинаково понимать настройки и правила.
+VPN_SOURCES=("$SOURCE_DIR/GuardSettings.swift" "$SOURCE_DIR/VpnSafety.swift" "$SOURCE_DIR/VpnConfig.swift" "$SOURCE_DIR/VpnSettingsWindow.swift")
+swiftc -O -parse-as-library -target "$TARGET" "$SOURCE_DIR/ClaudeVPNGuard.swift" "$SOURCE_DIR/DaemonMain.swift" "${VPN_SOURCES[@]}" -o "$STAGE/ClaudeVPNGuard"
+swiftc -O -parse-as-library -target "$TARGET" "$SOURCE_DIR/gatekeeper-src/Gatekeeper.swift" "$SOURCE_DIR/gatekeeper-src/ProfileStore.swift" "${VPN_SOURCES[@]}" -o "$STAGE/Gatekeeper"
 swiftc -O -parse-as-library -target "$TARGET" "$SOURCE_DIR/gatekeeper-src/ProfileCtl.swift" "$SOURCE_DIR/gatekeeper-src/ProfileStore.swift" -o "$STAGE/ProfileCtl"
 
 APP_ID=""
@@ -148,7 +155,7 @@ cat > "$STAGE/Claude.app/Contents/Info.plist" <<'PLIST'
 <key>CFBundleName</key><string>Claude</string>
 <key>CFBundleDisplayName</key><string>Claude</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>4.2</string>
+<key>CFBundleShortVersionString</key><string>5.0</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 </dict></plist>
 PLIST
@@ -198,7 +205,7 @@ mv "$DEST_DIR/ClaudeVPNGuard.new" "$DEST_DIR/ClaudeVPNGuard"
 install -m 755 "$STAGE/ProfileCtl" "$DEST_DIR/ProfileCtl.new"
 mv "$DEST_DIR/ProfileCtl.new" "$DEST_DIR/ProfileCtl"
 mkdir -p "$DEST_DIR/gatekeeper-src"
-for file in install.sh uninstall.sh start.sh stop.sh status.sh README.md profiles.json GuardSettings.swift VpnSafety.swift ClaudeVPNGuard.swift DaemonMain.swift; do
+for file in install.sh uninstall.sh start.sh stop.sh status.sh README.md profiles.json GuardSettings.swift VpnSafety.swift VpnConfig.swift VpnSettingsWindow.swift ClaudeVPNGuard.swift DaemonMain.swift; do
     if [ "$file" != "profiles.json" ]; then cp "$SOURCE_DIR/$file" "$DEST_DIR/$file"; fi
 done
 for file in Gatekeeper.swift ProfileStore.swift ProfileCtl.swift; do

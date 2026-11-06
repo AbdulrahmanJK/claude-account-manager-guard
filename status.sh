@@ -3,7 +3,7 @@
 DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN="$DIR/ClaudeVPNGuard"
 
-echo "=== Статус Claude VPN Guard v4.0 (Multi-Account) ==="
+echo "=== Статус Claude VPN Guard v5.0 (Multi-Account) ==="
 
 # 1. Процесс демона
 PID=$(pgrep -f "$BIN" || true)
@@ -79,16 +79,37 @@ elif [ -f "$CLAUDE_JSON" ]; then
     echo "⚠️ ~/.claude.json: файл (не symlink)"
 fi
 
-# 4. Статус повседневного VPN
-if [ -z "${DEFAULT_VPN_NAME:-}" ] && [ -f "$DIR/guard-settings.json" ]; then
-    DEFAULT_VPN_NAME=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("defaultVpnServiceName", ""))' "$DIR/guard-settings.json" 2>/dev/null || true)
-fi
-if [ -n "${DEFAULT_VPN_NAME:-}" ]; then
-    VPN_STATUS=$(scutil --nc status "$DEFAULT_VPN_NAME" 2>/dev/null | head -n 1)
-    echo "📶 $DEFAULT_VPN_NAME: ${VPN_STATUS:-Не найден}"
-else
-    echo "📶 Повседневный VPN: не настроен"
-fi
+# 4. Статус VPN из настроек (vpn-config.json; у старых установок есть только guard-settings.json)
+python3 - "$DIR/vpn-config.json" "$DIR/guard-settings.json" <<'PY'
+import json, subprocess, sys
+
+def status(entry):
+    if entry.get("kind") == "app":
+        running = subprocess.run(["pgrep", "-f", (entry.get("appPath") or "") + "/Contents/MacOS/"],
+                                 capture_output=True).returncode == 0
+        return "приложение запущено" if running else "приложение не запущено"
+    out = subprocess.run(["scutil", "--nc", "status", entry.get("serviceName") or ""],
+                         capture_output=True, text=True).stdout
+    return (out.splitlines() or ["Не найден"])[0]
+
+try:
+    config = json.load(open(sys.argv[1]))
+except (OSError, ValueError):
+    config = None
+if config is None:
+    try:
+        legacy = json.load(open(sys.argv[2]))
+        print(f"📶 Без Claude: {legacy['defaultVpnServiceName']} (старые настройки — выберите рабочий VPN в «Настройках VPN»)")
+    except (OSError, ValueError, KeyError):
+        print("📶 VPN не настроен: откройте «Настройки VPN» в окне запуска Claude")
+    sys.exit(0)
+
+entries = {e["id"]: e for e in config.get("entries", [])}
+work = entries.get(config.get("workVpnId"))
+other = entries.get(config.get("otherVpnId")) if config.get("otherVpnId") != config.get("workVpnId") else None
+print(f"📶 Для Claude: {work['name']} — {status(work)}" if work else "📶 Для Claude: VPN не выбран")
+print(f"📶 Без Claude: {other['name']} — {status(other)}" if other else "📶 Без Claude: ничего не менять")
+PY
 
 # 5. Последние 10 строк лога
 if [ -f "$DIR/guard.log" ]; then

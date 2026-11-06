@@ -25,3 +25,4 @@ profiles/
 guard-settings.json
 .env
 guard-control.json
+vpn-config.json

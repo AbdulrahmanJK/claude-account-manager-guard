@@ -1,13 +1,12 @@
 import Foundation
 
+/// Формат guard-settings.json до версии 5. Читается только для переноса в vpn-config.json.
 struct GuardSettings: Decodable {
     let defaultVpnServiceName: String
     let defaultVpnBundleId: String
 
-    static func load() -> GuardSettings? {
-        let path = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude-vpn-guard/guard-settings.json")
-        if let data = try? Data(contentsOf: path),
+    static func load(from url: URL) -> GuardSettings? {
+        if let data = try? Data(contentsOf: url),
            let settings = try? JSONDecoder().decode(GuardSettings.self, from: data),
            !settings.defaultVpnServiceName.isEmpty, !settings.defaultVpnBundleId.isEmpty {
             return settings
