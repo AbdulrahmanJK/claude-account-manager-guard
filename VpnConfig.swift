@@ -157,8 +157,11 @@ struct DiscoveredVpnService: Equatable {
 }
 
 enum SystemVpnServices {
-    /// Все сервисы текущего сетевого набора, у которых есть «соединение» (VPN, IPSec, PPP).
-    /// Wi‑Fi и Ethernet отсекаются сами: для них система отдаёт статус invalid.
+    /// Типы интерфейсов, у которых бывает «соединение»: VPN на NetworkExtension, IPSec (IKEv1/IKEv2)
+    /// и PPP (под ним L2TP/PPTP).
+    private static let connectionInterfaceTypes: Set<String> = ["VPN", "IPSec", "PPP"]
+
+    /// Все VPN-сервисы текущего сетевого набора.
     /// Читаем через SystemConfiguration, а не через `scutil`: агент делает это каждые 2 секунды,
     /// и запуск процесса на каждую проверку был бы заметно дороже.
     static func all() -> [SystemVpnService] {
@@ -166,7 +169,14 @@ enum SystemVpnServices {
               let set = SCNetworkSetCopyCurrent(prefs),
               let services = SCNetworkSetCopyServices(set) as? [SCNetworkService] else { return [] }
         return services.compactMap { service in
-            guard let id = SCNetworkServiceGetServiceID(service).map({ $0 as String }),
+            // Тип интерфейса проверяем до запроса статуса. Для Wi‑Fi, Ethernet и моста
+            // SCNetworkConnectionGetStatus отвечает «invalid» только через ~300 мс, а таких
+            // интерфейсов бывает с полдюжины: одна проверка занимала почти 2 секунды, и главный
+            // поток агента и окна запуска не успевал освобождаться — всё висло.
+            guard let interface = SCNetworkServiceGetInterface(service),
+                  let type = SCNetworkInterfaceGetInterfaceType(interface).map({ $0 as String }),
+                  connectionInterfaceTypes.contains(type),
+                  let id = SCNetworkServiceGetServiceID(service).map({ $0 as String }),
                   let name = SCNetworkServiceGetName(service).map({ $0 as String }),
                   let connection = SCNetworkConnectionCreateWithServiceID(nil, id as CFString, nil, nil) else { return nil }
             let status = SCNetworkConnectionGetStatus(connection)
